@@ -46,6 +46,8 @@ static enum jaylink_usb_address usb_address;
 static bool use_usb_address;
 static enum jaylink_target_interface iface = JAYLINK_TIF_JTAG;
 static bool trace_enabled;
+/* 2-pin cJTAG (IEEE 1149.7 OScan1), translated by the probe firmware */
+static bool cjtag_mode;
 
 #define JLINK_MAX_SPEED			12000
 #define JLINK_TAP_BUFFER_SIZE	2048
@@ -90,6 +92,7 @@ static int jlink_swd_switch_seq(enum swd_special_seq seq);
 /* J-Link tap buffer functions */
 static void jlink_tap_init(void);
 static int jlink_flush(void);
+static int jlink_cjtag_tlr(void);
 /**
  * Queue data to go out and in, flushing the queue as many times as
  * necessary.
@@ -409,9 +412,13 @@ static int select_interface(void)
 {
 	int ret;
 	uint32_t interfaces;
+	enum jaylink_target_interface tif = iface;
+
+	if (iface == JAYLINK_TIF_JTAG && cjtag_mode)
+		tif = JAYLINK_TIF_CJTAG;
 
 	if (!jaylink_has_cap(caps, JAYLINK_DEV_CAP_SELECT_TIF)) {
-		if (iface != JAYLINK_TIF_JTAG) {
+		if (tif != JAYLINK_TIF_JTAG) {
 			LOG_ERROR("Device supports JTAG transport only");
 			return ERROR_JTAG_INIT_FAILED;
 		}
@@ -427,12 +434,12 @@ static int select_interface(void)
 		return ERROR_JTAG_INIT_FAILED;
 	}
 
-	if (!(interfaces & (1 << iface))) {
+	if (!(interfaces & (1 << tif))) {
 		LOG_ERROR("Selected transport is not supported by the device");
 		return ERROR_JTAG_INIT_FAILED;
 	}
 
-	ret = jaylink_select_interface(devh, iface, NULL);
+	ret = jaylink_select_interface(devh, tif, NULL);
 
 	if (ret < 0) {
 		LOG_ERROR("jaylink_select_interface() failed: %s",
@@ -924,9 +931,18 @@ static int jlink_state_move(void)
 {
 	uint8_t tms_scan;
 	uint8_t tms_scan_bits;
+	enum tap_state state = tap_get_state();
 
-	tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
-	tms_scan_bits = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
+	if (cjtag_mode) {
+		if (tap_get_end_state() == TAP_RESET)
+			return jlink_cjtag_tlr();
+		/* After the re-activation, the TAP is physically in Run-Test/Idle */
+		if (state == TAP_RESET)
+			state = TAP_IDLE;
+	}
+
+	tms_scan = tap_get_tms_path(state, tap_get_end_state());
+	tms_scan_bits = tap_get_tms_path_len(state, tap_get_end_state());
 
 	int retval = jlink_clock_data(NULL, 0, &tms_scan, 0, NULL, 0, tms_scan_bits);
 	if (retval != ERROR_OK)
@@ -942,6 +958,12 @@ static int jlink_path_move(unsigned int num_states, enum tap_state *path)
 
 	for (unsigned int i = 0; i < num_states; i++) {
 		int retval;
+		if (cjtag_mode && path[i] == TAP_RESET) {
+			retval = jlink_cjtag_tlr();
+			if (retval != ERROR_OK)
+				return retval;
+			continue;
+		}
 		if (path[i] == tap_state_transition(tap_get_state(), false)) {
 			retval = jlink_clock_data(NULL, 0, NULL, 0, NULL, 0, 1);
 		} else if (path[i] == tap_state_transition(tap_get_state(), true)) {
@@ -963,7 +985,8 @@ static int jlink_path_move(unsigned int num_states, enum tap_state *path)
 
 static int jlink_stableclocks(unsigned int num_cycles)
 {
-	uint8_t tms = tap_get_state() == TAP_RESET;
+	/* With cJTAG, Test-Logic-Reset is physically Run-Test/Idle, see above */
+	uint8_t tms = tap_get_state() == TAP_RESET && !cjtag_mode;
 	/* Execute num_cycles. */
 	for (unsigned int i = 0; i < num_cycles; i++) {
 		int retval = jlink_clock_data(NULL, 0, &tms, 0, NULL, 0, 1);
@@ -1023,6 +1046,81 @@ static void jlink_reset(int trst, int srst)
 
 	if (trst == 0)
 		jaylink_jtag_set_trst(devh);
+}
+
+/*
+ * Test-Logic-Reset deactivates the OScan1 protocol of a cJTAG target. Go
+ * through it, then re-activate the target: the sequence was taken from the
+ * traffic of the J-Link DLL (V8.44) with a CC2650. The firmware translation
+ * is off while the escape and the online activation code (OAC) are sent.
+ * The TAP ends in Run-Test/Idle, with the IDCODE selected.
+ */
+static int jlink_cjtag_tlr(void)
+{
+	static const uint8_t tlr[] = { 0x1f };
+	static const uint8_t ones[26] = {
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0x00
+	};
+	static const uint8_t zeros[26];
+	/* OAC, extension code and check packet (50 bits) */
+	static const uint8_t oac[] = { 0xad, 0x65, 0x59, 0x16, 0x16, 0x80, 0x01 };
+	static const uint8_t cp1[] = { 0x01, 0xd6, 0x00 };
+	static const uint8_t cp2[] = { 0x1b };
+	uint8_t tdo[26];
+	int ret;
+
+	int retval = jlink_clock_data(NULL, 0, tlr, 0, NULL, 0, 5);
+	if (retval == ERROR_OK)
+		retval = jlink_flush();
+	if (retval != ERROR_OK)
+		return retval;
+
+	LOG_DEBUG_IO("cJTAG activation");
+
+	ret = jaylink_cjtag_config(devh, 9, 0, NULL);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_cjtag_config(devh, 8, 0, NULL);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_jtag_io(devh, ones, zeros, tdo, 201, JAYLINK_JTAG_VERSION_2);
+	/* Selection escape: six TMSC edges while TCKC is high */
+	if (ret == JAYLINK_OK)
+		ret = jaylink_jtag_clear_tck(devh);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_jtag_clear_tms(devh);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_jtag_set_tck(devh);
+	for (unsigned int i = 0; i < 3 && ret == JAYLINK_OK; i++) {
+		ret = jaylink_jtag_set_tms(devh);
+		if (ret == JAYLINK_OK)
+			ret = jaylink_jtag_clear_tms(devh);
+	}
+	if (ret == JAYLINK_OK)
+		ret = jaylink_jtag_io(devh, zeros, zeros, tdo, 32, JAYLINK_JTAG_VERSION_2);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_cjtag_config(devh, 10, 0, NULL);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_jtag_io(devh, oac, zeros, tdo, 50, JAYLINK_JTAG_VERSION_2);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_cjtag_config(devh, 10, 0, NULL);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_cjtag_config(devh, 8, 1, NULL);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_jtag_io(devh, cp1, zeros, tdo, 18, JAYLINK_JTAG_VERSION_2);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_cjtag_config(devh, 10, 0, NULL);
+	if (ret == JAYLINK_OK)
+		ret = jaylink_jtag_io(devh, cp2, zeros, tdo, 6, JAYLINK_JTAG_VERSION_2);
+
+	if (ret != JAYLINK_OK) {
+		LOG_ERROR("cJTAG activation failed: %s", jaylink_strerror(ret));
+		return ERROR_JTAG_QUEUE_FAILED;
+	}
+
+	jlink_last_state = TAP_IDLE;
+	tap_set_state(TAP_RESET);
+	return ERROR_OK;
 }
 
 static int jlink_reset_safe(int trst, int srst)
@@ -1142,6 +1240,20 @@ COMMAND_HANDLER(jlink_handle_jlink_jtag_command)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 	}
 
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(jlink_handle_cjtag_command)
+{
+	if (!CMD_ARGC) {
+		command_print(CMD, "cJTAG is %s", cjtag_mode ? "on" : "off");
+		return ERROR_OK;
+	}
+
+	if (CMD_ARGC != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	COMMAND_PARSE_ON_OFF(CMD_ARGV[0], cjtag_mode);
 	return ERROR_OK;
 }
 
@@ -1945,6 +2057,13 @@ static const struct command_registration jlink_subcommand_handlers[] = {
 		.mode = COMMAND_EXEC,
 		.help = "select the JTAG command version",
 		.usage = "[2|3]",
+	},
+	{
+		.name = "cjtag",
+		.handler = &jlink_handle_cjtag_command,
+		.mode = COMMAND_CONFIG,
+		.help = "use 2-pin cJTAG (OScan1) instead of 4-pin JTAG",
+		.usage = "[on|off]",
 	},
 	{
 		.name = "targetpower",

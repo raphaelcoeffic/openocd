@@ -3123,6 +3123,13 @@ Display free device internal memory.
 Set the JTAG command version to be used. Without argument, show the actual JTAG
 command version.
 @end deffn
+@deffn {Config Command} {jlink cjtag} [@option{on}|@option{off}]
+Use 2-pin cJTAG (IEEE 1149.7, OScan1) instead of 4-pin JTAG; only TMS and TCK
+are connected to the target. The probe firmware translates the JTAG operations.
+Since Test-Logic-Reset deactivates the OScan1 protocol, the target is activated
+again after each one; it then stays in Run-Test/Idle with the IDCODE selected.
+Without argument, show whether cJTAG is used.
+@end deffn
 @deffn {Command} {jlink targetpower}  [@option{0}|@option{1}|@option{on}|@option{off}]
 Switch the 5@ V target power supply on or off.
 Without argument, show the state of the target power supply.
