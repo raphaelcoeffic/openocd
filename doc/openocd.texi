@@ -7400,6 +7400,54 @@ flash bank $_FLASHNAME cc26xx 0 0 0 0 $_TARGETNAME
 @end example
 @end deffn
 
+@deffn {Flash Driver} {cc27xx}
+Flash driver for the SimpleLink Low Power F3 CC27xx (and CC23x1) devices from
+Texas Instruments. There are three banks: main flash at 0, the CCFG sector at
+0x4e020000 and the SCFG sector at 0x4e040000. The CCFG and SCFG are written
+whole; a CCFG is only written if its CRCs are valid.
+
+On a booted, halted device, the boot ROM's flash functions erase and program
+single sectors: no chip erase, and the HSM firmware and the other sectors stay
+as they are. Sectors protected by the CCFG (@code{flashProt}, often the CCFG
+and SCFG themselves) are refused; a CCFG that leaves its own sector
+unprotected can be rewritten this way.
+
+While the boot ROM is in SACI, its command interface on the SEC-AP (a blank
+device, or after @command{cc27xx mass_erase}), the SACI programming commands
+are used instead; only a chip erase erases there, so erasing only checks that
+the sectors are blank. The main bank size can't be read in SACI: give it in
+the flash bank command (0 reads it from a booted device).
+
+The target configuration uses the commands below for the reset events: with
+SWD connected, the boot ROM always stops in SACI after a reset.
+
+@example
+flash bank $_CHIPNAME.flash cc27xx 0 0 0 0 $_TARGETNAME
+flash bank $_CHIPNAME.ccfg cc27xx 0x4e020000 0 0 0 $_TARGETNAME
+flash bank $_CHIPNAME.scfg cc27xx 0x4e040000 0 0 0 $_TARGETNAME
+@end example
+
+@deffn {Command} {cc27xx mass_erase}
+Erase main flash, CCFG and SCFG through SACI, keeping the HSM firmware. The
+device stays in SACI until the next reset; the flash writes until then go
+through SACI. Program the whole image, including a valid CCFG, then reset:
+@example
+init; cc27xx mass_erase; flash write_image image.elf; reset
+@end example
+@end deffn
+
+@deffn {Command} {cc27xx reset_assert}
+Reset the device through the SEC-AP and keep the boot ROM in SACI. Used by
+the reset-assert event.
+@end deffn
+
+@deffn {Command} {cc27xx saci_exit}
+Leave SACI: halt at the application's entry if the reset halts, else run. A
+device without a valid CCFG, SCFG or application stays in SACI. Used by the
+reset-deassert-post and examine-start events.
+@end deffn
+@end deffn
+
 @deffn {Flash Driver} {cc3220sf}
 The CC3220SF version of the SimpleLink CC32xx microcontrollers from Texas
 Instruments includes 1MB of internal flash. The cc3220sf flash driver only

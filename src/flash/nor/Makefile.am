@@ -27,6 +27,7 @@ NOR_DRIVERS = \
 	%D%/bluenrg-x.c \
 	%D%/cc3220sf.c \
 	%D%/cc26xx.c \
+	%D%/cc27xx.c \
 	%D%/cfi.c \
 	%D%/dsp5680xx_flash.c \
 	%D%/dw-spi.c \
