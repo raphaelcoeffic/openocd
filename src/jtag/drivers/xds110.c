@@ -1011,6 +1011,55 @@ static bool ocd_pathmove(uint32_t num_states, uint8_t *path)
 				DEFAULT_ATTEMPTS, DEFAULT_TIMEOUT);
 }
 
+/*
+ * Send an arbitrary bit sequence on TMS (SWDIO), LSB first: the firmware has
+ * no raw sequence command, so the bits become a path through the TAP state
+ * machine from Test-Logic-Reset. Needs the probe in JTAG mode.
+ */
+static bool xds_tms_sequence(const uint8_t *bits, unsigned int num_bits)
+{
+	uint8_t path[256];
+	enum tap_state state = TAP_RESET;
+
+	if (xds110.firmware < OCD_FIRMWARE_VERSION)
+		return false;
+	if (!xds_goto_state(XDS_JTAG_STATE_RESET))
+		return false;
+
+	for (unsigned int done = 0; done < num_bits; ) {
+		unsigned int n = MIN(num_bits - done, ARRAY_SIZE(path));
+		for (unsigned int i = 0; i < n; i++) {
+			unsigned int bit = done + i;
+			state = tap_state_transition(state, (bits[bit / 8] >> (bit % 8)) & 1);
+			path[i] = (uint8_t)xds_jtag_state[state];
+		}
+		if (!ocd_pathmove(n, path))
+			return false;
+		done += n;
+	}
+	return true;
+}
+
+/*
+ * Connect to the DAP in SWD mode. The firmware's SWD_CONNECT only sends the
+ * JTAG-to-SWD sequence: a SW-DP that powers up dormant (TI CC27xx) never
+ * answers it. On failure, send JTAG-to-dormant and dormant-to-SWD as TMS
+ * sequences in JTAG mode, then connect again.
+ */
+static bool xds_swd_connect(uint32_t *idcode)
+{
+	if (swd_connect() && cmapi_connect(idcode))
+		return true;
+
+	LOG_DEBUG("XDS110: no SWD answer, waking the DP from dormant");
+	if (!swd_disconnect())
+		return false;
+	if (!xds_tms_sequence(swd_seq_jtag_to_dormant, swd_seq_jtag_to_dormant_len) ||
+		!xds_tms_sequence(swd_seq_dormant_to_swd, swd_seq_dormant_to_swd_len))
+		return false;
+	return swd_connect() && cmapi_connect(idcode);
+}
+
 /***************************************************************************
  *   swd driver interface                                                  *
  *                                                                         *
@@ -1037,16 +1086,12 @@ static int xds110_swd_switch_seq(enum swd_special_seq seq)
 		xds110.is_swd_mode = false;
 		xds110.is_cmapi_connected = false;
 		xds110.is_cmapi_acquired = false;
-		/* Run sequence to put target in SWD mode */
-		success = swd_connect();
-		/* Re-initialize CMAPI API for DAP access */
+		/* Put target in SWD mode, re-initialize CMAPI API for DAP access */
+		success = xds_swd_connect(&idcode);
 		if (success) {
 			xds110.is_swd_mode = true;
-			success = cmapi_connect(&idcode);
-			if (success) {
-				xds110.is_cmapi_connected = true;
-				success = cmapi_acquire();
-			}
+			xds110.is_cmapi_connected = true;
+			success = cmapi_acquire();
 		}
 		break;
 	case SWD_TO_JTAG:
@@ -1408,20 +1453,14 @@ static int xds110_init(void)
 			success = xds_cycle_tck(50);
 	}
 
-	if (success) {
-		if (xds110.is_swd_mode) {
-			/* Switch to SWD if needed */
-			success = swd_connect();
-		} else {
-			success = cjtag_connect(MODE_JTAG);
-		}
-	}
+	if (success && !xds110.is_swd_mode)
+		success = cjtag_connect(MODE_JTAG);
 
 	if (success && xds110.is_swd_mode) {
 		uint32_t idcode;
 
-		/* Connect to CMAPI interface in XDS110 */
-		success = cmapi_connect(&idcode);
+		/* Switch to SWD, connect to CMAPI interface in XDS110 */
+		success = xds_swd_connect(&idcode);
 
 		/* Acquire exclusive access to CMAPI interface */
 		if (success) {
